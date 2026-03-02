@@ -1,12 +1,15 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.config import settings
 
 
-client = TestClient(app)
+def test_status_endpoint_shape(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path / "storage"))
+    from app import main as app_main
 
-
-def test_status_endpoint_shape():
+    monkeypatch.setattr(app_main, "_run_pipeline", lambda recipe_id, recipe_storage: None)
+    client = TestClient(app_main.app)
     upload = client.post(
         "/api/recipes/upload",
         files={"file": ("sample.mp4", b"fake-video-bytes", "video/mp4")},

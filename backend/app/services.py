@@ -1,17 +1,18 @@
-import base64
 import json
+import logging
 import subprocess
 from pathlib import Path
 
-from openai import OpenAI
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .llm.ollama_client import describe_images, generate_json
 from .models import Recipe
 from .schemas import RecipeData
 
 progress_store: dict[int, int] = {}
+logger = logging.getLogger(__name__)
 
 
 def _run_ffmpeg(args: list[str]) -> None:
@@ -38,64 +39,103 @@ def _extract_frames(video_path: Path, frames_dir: Path) -> list[Path]:
     return [frames[int(i * step)] for i in range(30)]
 
 
-def _transcribe_audio(client: OpenAI, audio_path: Path) -> str:
-    with audio_path.open("rb") as audio_file:
-        transcript = client.audio.transcriptions.create(model=settings.transcription_model, file=audio_file)
-    return transcript.text.strip()
+def _sample_frames(frame_paths: list[Path], sample_count: int = 8) -> list[Path]:
+    if len(frame_paths) <= sample_count:
+        return frame_paths
+    step = (len(frame_paths) - 1) / (sample_count - 1)
+    return [frame_paths[round(i * step)] for i in range(sample_count)]
 
 
-def _vision_notes(client: OpenAI, frame_paths: list[Path]) -> str:
-    if not frame_paths:
+def _transcribe_audio(audio_path: Path) -> str:
+    from .transcribe.local_whisper import transcribe_wav
+
+    return transcribe_wav(
+        path=str(audio_path),
+        model_size=settings.transcription_model_size,
+        device=settings.transcription_device,
+        compute_type=settings.transcription_compute_type,
+    )
+
+
+def _vision_notes(video_path: Path, frames_dir: Path) -> str:
+    if not settings.enable_vision:
+        logger.info("Vision disabled; skipping frame analysis.")
         return ""
-    sampled = frame_paths[:10]
-    content = [{"type": "input_text", "text": "Summarize visible ingredients, actions, cookware, temperatures, and timing clues as bullet points."}]
-    for frame in sampled:
-        image_b64 = base64.b64encode(frame.read_bytes()).decode("utf-8")
-        content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"})
     try:
-        resp = client.responses.create(model=settings.vision_model, input=[{"role": "user", "content": content}])
-        return (resp.output_text or "").strip()
-    except Exception:
+        frames = _extract_frames(video_path, frames_dir)
+        sampled = _sample_frames(frames, sample_count=8)
+        if not sampled:
+            return ""
+        prompt = (
+            "Summarize visible ingredients, actions, cookware, temperatures, and timing clues as concise bullet points. "
+            "If the frames are unclear, say so briefly."
+        )
+        return describe_images(prompt=prompt, frame_paths=sampled, model=settings.vision_model, host=settings.ollama_host)
+    except Exception as exc:
+        logger.warning("Vision step skipped: %s", exc)
         return ""
 
 
 def _recipe_prompt(transcript: str, vision_notes: str) -> str:
+    schema = json.dumps(RecipeData.model_json_schema(), indent=2)
+    vision_section = vision_notes or "No vision notes provided."
     return f"""
-You are a recipe extraction system. Return STRICT JSON ONLY with this schema:
-{{
-  "title": string,
-  "servings": number|null,
-  "total_time_minutes": number|null,
-  "ingredients": [{{"item": string, "quantity": number|null, "unit": string|null, "prep": string|null}}],
-  "steps": [{{"n": number, "text": string, "timer_seconds": number|null}}],
-  "equipment": [string],
-  "notes": [string]
-}}
-No markdown, no prose.
+You are a recipe extraction system.
+Return ONLY JSON. No markdown, no code fences, no commentary.
+Use exactly this schema and field names:
+{schema}
+
+Rules:
+- Return a single JSON object.
+- Use null for unknown values.
+- Do not add trailing commas.
+- Keep step numbering sequential starting at 1.
+- Ingredients must be objects with item, quantity, unit, and prep.
+- If information is uncertain, keep the value conservative and note the uncertainty in notes.
 
 Transcript:
 {transcript}
 
 Vision notes:
-{vision_notes}
+{vision_section}
 """.strip()
 
 
-def _generate_recipe(client: OpenAI, transcript: str, vision_notes: str) -> RecipeData:
-    prompt = _recipe_prompt(transcript, vision_notes)
-    resp = client.responses.create(model=settings.recipe_model, input=prompt)
-    text = (resp.output_text or "").strip()
+def _repair_prompt(bad_content: str) -> str:
+    schema = json.dumps(RecipeData.model_json_schema(), indent=2)
+    return f"""
+Repair this into strict valid JSON only.
+Return a single JSON object with no markdown and no commentary.
+Use exactly this schema:
+{schema}
 
-    def parse_recipe(raw: str) -> RecipeData:
-        payload = json.loads(raw)
-        return RecipeData.model_validate(payload)
+Rules:
+- Preserve the recipe content when possible.
+- Use null for unknown values.
+- Remove trailing commas.
+
+Bad content:
+{bad_content}
+""".strip()
+
+
+def _parse_recipe(raw: str) -> RecipeData:
+    payload = json.loads(raw)
+    return RecipeData.model_validate(payload)
+
+
+def _generate_recipe(transcript: str, vision_notes: str) -> RecipeData:
+    prompt = _recipe_prompt(transcript, vision_notes)
+    text = generate_json(prompt=prompt, model=settings.recipe_model, host=settings.ollama_host)
 
     try:
-        return parse_recipe(text)
+        return _parse_recipe(text)
     except (json.JSONDecodeError, ValidationError):
-        fix_prompt = f"Fix this into strict valid JSON for the schema only. Return JSON only.\nSchema: {RecipeData.model_json_schema()}\nBad content:\n{text}"
-        fixed = client.responses.create(model=settings.recipe_model, input=fix_prompt)
-        return parse_recipe((fixed.output_text or "").strip())
+        fixed = generate_json(prompt=_repair_prompt(text), model=settings.recipe_model, host=settings.ollama_host)
+        try:
+            return _parse_recipe(fixed)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            raise RuntimeError(f"Recipe model returned invalid JSON after repair attempt: {exc}") from exc
 
 
 def process_recipe(recipe_id: int, storage_dir: Path, db: Session) -> None:
@@ -108,27 +148,24 @@ def process_recipe(recipe_id: int, storage_dir: Path, db: Session) -> None:
     db.commit()
 
     try:
-        client = OpenAI(api_key=settings.openai_api_key)
         input_video = storage_dir / "input.mp4"
         audio_path = storage_dir / "audio.wav"
         frames_dir = storage_dir / "frames"
 
         _extract_audio(input_video, audio_path)
         progress_store[recipe_id] = 25
-        frames = _extract_frames(input_video, frames_dir)
-        progress_store[recipe_id] = 45
 
-        transcript = _transcribe_audio(client, audio_path)
+        transcript = _transcribe_audio(audio_path)
         recipe.transcript_text = transcript
         db.commit()
-        progress_store[recipe_id] = 65
+        progress_store[recipe_id] = 55
 
-        vision_notes = _vision_notes(client, frames)
+        vision_notes = _vision_notes(input_video, frames_dir)
         recipe.vision_notes = vision_notes
         db.commit()
-        progress_store[recipe_id] = 80
+        progress_store[recipe_id] = 75
 
-        recipe_data = _generate_recipe(client, transcript, vision_notes)
+        recipe_data = _generate_recipe(transcript, vision_notes)
         recipe.recipe_json = recipe_data.model_dump_json(indent=2)
         recipe.status = "ready"
         progress_store[recipe_id] = 100
