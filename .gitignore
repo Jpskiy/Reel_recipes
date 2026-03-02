@@ -1,8 +1,22 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
-node_modules/
-.next/
+backend/.venv/
 backend/app.db
 backend/storage/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/.next/
+
+# Env
 .env
+backend/.env
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db

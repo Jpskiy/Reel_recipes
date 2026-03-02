@@ -1,12 +1,4 @@
-import './globals.css';
-import { ReactNode } from 'react';
-
-export const metadata = {
-  title: 'Reel Recipes',
-  description: 'Upload cooking videos and turn them into recipes',
-};
-
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body>{children}</body>

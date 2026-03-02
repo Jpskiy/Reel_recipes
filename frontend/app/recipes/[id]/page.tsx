@@ -1,109 +1,108 @@
 'use client';
 
-import Link from 'next/link';
-import { useParams } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
-import { API_URL, RecipeData } from '../../../components/api';
+import { apiFetch } from '../../../lib/api';
 
-type StatusResponse = { status: 'uploaded' | 'processing' | 'ready' | 'error'; progress: number; error: string | null };
-type RecipeResponse = {
-  id: number;
-  status: string;
-  transcript_text: string;
-  vision_notes: string;
-  recipe: RecipeData | null;
-  error_message: string | null;
+type RecipeData = {
+  title: string;
+  description: string;
+  ingredients: string[];
+  steps: string[];
+  prep_time_minutes: number | null;
+  cook_time_minutes: number | null;
+  servings: number | null;
+  notes: string;
 };
 
-export default function RecipePage() {
-  const params = useParams<{ id: string }>();
-  const id = params.id;
+type StatusResponse = { status: 'queued' | 'processing' | 'ready' | 'error'; progress: number; error_message: string | null };
+type RecordResponse = { id: string; status: string; progress: number; error_message: string | null; recipe_json: RecipeData | null };
+
+export default function RecipeDetailPage({ params }: { params: { id: string } }) {
   const [status, setStatus] = useState<StatusResponse | null>(null);
-  const [recipeData, setRecipeData] = useState<RecipeData | null>(null);
-  const [editor, setEditor] = useState('');
-  const [saveMsg, setSaveMsg] = useState('');
+  const [record, setRecord] = useState<RecordResponse | null>(null);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
 
-  async function loadStatus() {
-    const res = await fetch(`${API_URL}/api/recipes/${id}/status`);
-    if (res.ok) setStatus(await res.json());
-  }
-
-  async function loadRecipe() {
-    const res = await fetch(`${API_URL}/api/recipes/${id}`);
-    if (!res.ok) return;
-    const data: RecipeResponse = await res.json();
-    setRecipeData(data.recipe);
-    setEditor(JSON.stringify(data.recipe, null, 2));
-  }
+  const recipe = useMemo(() => record?.recipe_json ?? null, [record]);
 
   useEffect(() => {
-    loadStatus();
-    const interval = setInterval(loadStatus, 2000);
-    return () => clearInterval(interval);
-  }, [id]);
+    let interval: NodeJS.Timeout | undefined;
 
-  useEffect(() => {
-    if (status?.status === 'ready') loadRecipe();
-  }, [status?.status]);
+    const poll = async () => {
+      try {
+        const s = await apiFetch<StatusResponse>(`/api/recipes/${params.id}/status`);
+        setStatus(s);
+        if (s.status === 'ready' || s.status === 'error') {
+          const rec = await apiFetch<RecordResponse>(`/api/recipes/${params.id}`);
+          setRecord(rec);
+          if (interval) clearInterval(interval);
+        }
+      } catch (e) {
+        setError((e as Error).message);
+        if (interval) clearInterval(interval);
+      }
+    };
 
-  const groceryItems = useMemo(() => recipeData?.ingredients.map((i) => `${i.quantity ?? ''} ${i.unit ?? ''} ${i.item}`.trim()) ?? [], [recipeData]);
+    poll();
+    interval = setInterval(poll, 3000);
+    return () => interval && clearInterval(interval);
+  }, [params.id]);
 
-  async function saveEdits() {
+  const saveRecipe = async () => {
+    if (!record?.recipe_json) return;
+    setSaving(true);
     try {
-      const parsed = JSON.parse(editor);
-      const res = await fetch(`${API_URL}/api/recipes/${id}`, {
+      const updated = await apiFetch<RecordResponse>(`/api/recipes/${params.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipe: parsed }),
+        body: JSON.stringify(record.recipe_json),
       });
-      if (res.ok) {
-        setSaveMsg('Saved successfully');
-        setRecipeData(parsed);
-      } else {
-        setSaveMsg('Failed to save');
-      }
-    } catch {
-      setSaveMsg('Invalid JSON');
+      setRecord(updated);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
     }
-  }
+  };
 
   return (
-    <main>
-      <Link href="/">← Back</Link>
-      <h1>Recipe #{id}</h1>
-      <div className="card">
-        <h2>Status</h2>
-        <p>{status ? `${status.status} (${status.progress}%)` : 'Loading...'}</p>
-        {status?.error && <p>Error: {status.error}</p>}
-      </div>
+    <main style={{ maxWidth: 900, margin: '2rem auto', fontFamily: 'sans-serif' }}>
+      <a href="/">← Back</a>
+      <h1>Recipe Job {params.id}</h1>
+      {status && <p>Status: {status.status} ({status.progress}%)</p>}
+      {status?.error_message && <p style={{ color: 'red' }}>{status.error_message}</p>}
+      {error && <p style={{ color: 'red' }}>{error}</p>}
 
-      {recipeData && (
-        <>
-          <div className="card">
-            <h2>{recipeData.title}</h2>
-            <p>Servings: {recipeData.servings ?? 'N/A'} | Total time: {recipeData.total_time_minutes ?? 'N/A'} min</p>
-            <h3>Ingredients</h3>
-            <ul>{recipeData.ingredients.map((i, idx) => <li key={idx}>{i.quantity ?? ''} {i.unit ?? ''} {i.item} {i.prep ? `(${i.prep})` : ''}</li>)}</ul>
-            <h3>Steps</h3>
-            <ol>{recipeData.steps.map((s) => <li key={s.n}>{s.text}</li>)}</ol>
-          </div>
+      {recipe && (
+        <section>
+          <label>Title <input value={recipe.title} onChange={(e) => setRecord((r) => r ? { ...r, recipe_json: { ...r.recipe_json!, title: e.target.value } } : r)} /></label>
+          <p>{recipe.description}</p>
 
-          <div className="card">
-            <h3>Grocery list</h3>
-            {groceryItems.map((item, idx) => (
-              <label key={idx} style={{ display: 'block' }}>
-                <input type="checkbox" /> {item}
-              </label>
+          <h2>Ingredients</h2>
+          <ul>
+            {recipe.ingredients.map((ing, i) => (
+              <li key={i}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={!!checked[`${i}-${ing}`]}
+                    onChange={() => setChecked((prev) => ({ ...prev, [`${i}-${ing}`]: !prev[`${i}-${ing}`] }))}
+                  />
+                  {ing}
+                </label>
+              </li>
             ))}
-          </div>
+          </ul>
 
-          <div className="card">
-            <h3>Edit recipe JSON</h3>
-            <textarea value={editor} onChange={(e) => setEditor(e.target.value)} />
-            <button onClick={saveEdits}>Save</button>
-            <p>{saveMsg}</p>
-          </div>
-        </>
+          <h2>Steps</h2>
+          <ol>
+            {recipe.steps.map((step, i) => (
+              <li key={i}>{step}</li>
+            ))}
+          </ol>
+          <button onClick={saveRecipe} disabled={saving}>{saving ? 'Saving...' : 'Save Recipe'}</button>
+        </section>
       )}
     </main>
   );
