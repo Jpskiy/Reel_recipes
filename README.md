@@ -1,168 +1,118 @@
-# Reel_recipes
+# Reel Recipes (Local-only AI Upload MVP)
 
-Upload-only MVP that converts short cooking videos (`.mp4/.mov/.webm`) into structured, editable recipes fully offline on a local machine after the required models are downloaded.
+A clean local-first MVP that turns uploaded recipe videos into editable recipes.
 
-## Tech stack
-- **Backend:** FastAPI, SQLAlchemy, SQLite, Pydantic, `faster-whisper`, Ollama HTTP API
-- **Frontend:** Next.js (App Router), TypeScript, plain CSS
-- **Media pipeline:** `ffmpeg` via safe `subprocess.run`
+## Stack
+- Frontend: Next.js (TypeScript, App Router) on port 3000
+- Backend: FastAPI (Python 3.11+) on port 8000
+- Storage: SQLite
+- AI: faster-whisper (local transcription) + Ollama (local LLM)
+- Media: ffmpeg audio extraction
 
-## Features
-- Upload video and get an immediate `recipe_id`
-- Background processing with status polling
-- Local audio transcription with `faster-whisper`
-- Local recipe JSON generation with Ollama
-- Strict schema validation with a one-shot JSON repair retry
-- Optional local vision notes with Ollama + `llava` (disabled by default)
-- SQLite persistence and local storage at `backend/storage/{recipe_id}`
+## Environment
+Copy backend env file:
 
-## Repository tree
-
-```text
-Reel_recipes/
-|-- backend/
-|   |-- app/
-|   |   |-- llm/
-|   |   |   |-- __init__.py
-|   |   |   `-- ollama_client.py
-|   |   |-- transcribe/
-|   |   |   |-- __init__.py
-|   |   |   `-- local_whisper.py
-|   |   |-- __init__.py
-|   |   |-- config.py
-|   |   |-- database.py
-|   |   |-- main.py
-|   |   |-- models.py
-|   |   |-- schemas.py
-|   |   `-- services.py
-|   |-- tests/
-|   |   |-- test_ollama_recipe_generation.py
-|   |   |-- test_schema.py
-|   |   `-- test_status_endpoint.py
-|   |-- .env.example
-|   `-- requirements.txt
-|-- frontend/
-|   |-- app/
-|   |   |-- recipes/[id]/page.tsx
-|   |   |-- globals.css
-|   |   |-- layout.tsx
-|   |   `-- page.tsx
-|   |-- components/api.ts
-|   |-- .env.example
-|   |-- next-env.d.ts
-|   |-- next.config.mjs
-|   |-- package.json
-|   `-- tsconfig.json
-|-- .gitignore
-|-- LICENSE
-`-- README.md
-```
-
-## Local setup
-
-### 1) Install ffmpeg
-- **macOS:** `brew install ffmpeg`
-- **Ubuntu/Debian:** `sudo apt update && sudo apt install ffmpeg`
-- **Windows:** install from https://ffmpeg.org/download.html and add `ffmpeg` to `PATH`
-
-Verify:
-```bash
-ffmpeg -version
-```
-
-### 2) Install Ollama
-- **Windows/macOS:** install from https://ollama.com/download
-- **Linux:** follow the install instructions at https://ollama.com/download/linux
-
-Start Ollama, then pull the local recipe model:
-```bash
-ollama pull qwen2.5:7b-instruct
-```
-
-Optional vision model:
-```bash
-ollama pull llava:7b
-```
-
-### 3) Backend setup (port 8000)
 ```bash
 cd backend
-python -m venv .venv
-# macOS/Linux
-source .venv/bin/activate
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
 cp .env.example .env
-uvicorn app.main:app --reload --port 8000
 ```
 
-Default backend settings are already local-only:
+Backend variables:
+- `DATABASE_URL=sqlite:///./app.db`
+- `STORAGE_DIR=storage`
+- `MAX_UPLOAD_MB=200`
+- `OLLAMA_HOST=http://localhost:11434`
+- `RECIPE_MODEL=qwen2.5:7b-instruct`
 - `TRANSCRIPTION_MODEL_SIZE=small`
 - `TRANSCRIPTION_DEVICE=cpu`
 - `TRANSCRIPTION_COMPUTE_TYPE=int8`
-- `OLLAMA_HOST=http://localhost:11434`
-- `RECIPE_MODEL=qwen2.5:7b-instruct`
 - `ENABLE_VISION=false`
 
-To enable optional frame analysis, set:
-- `ENABLE_VISION=true`
-- `VISION_MODEL=llava:7b`
+## Run locally
 
-### 4) Frontend setup (port 3000)
+### Backend
+```bash
+cd backend
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Frontend
 ```bash
 cd frontend
 npm install
-cp .env.example .env.local
 npm run dev
 ```
 
-Open http://localhost:3000.
+## Test the build
 
-## API endpoints
-- `POST /api/recipes/upload` returns `{id, status}`
-- `GET /api/recipes/{id}/status`
-- `GET /api/recipes/{id}`
-- `PUT /api/recipes/{id}`
-- `GET /api/recipes`
-
-## Recipe JSON schema
-```json
-{
-  "title": "string",
-  "servings": 2,
-  "total_time_minutes": 25,
-  "ingredients": [
-    {"item": "onion", "quantity": 1, "unit": null, "prep": "diced"}
-  ],
-  "steps": [
-    {"n": 1, "text": "Heat oil in pan.", "timer_seconds": 60}
-  ],
-  "equipment": ["pan"],
-  "notes": ["Adjust salt to taste"]
-}
+### Prerequisites
+```bash
+ffmpeg -version
 ```
+Expected: version output with build metadata.
+
+Install/pull Ollama model:
+```bash
+ollama pull qwen2.5:7b-instruct
+```
+Expected: model pulled successfully.
+
+Verify Ollama:
+```bash
+curl.exe http://localhost:11434/api/tags
+```
+Expected: JSON payload listing local models.
+
+### API + proxy checks
+1) Backend recipes list:
+```bash
+curl.exe http://localhost:8000/api/recipes
+```
+Expected: JSON array `[]` or recipe items.
+
+2) Frontend proxy rewrite:
+```bash
+curl.exe -i http://localhost:3000/api/recipes
+```
+Expected: `HTTP/1.1 200 OK` and JSON body.
+
+3) Upload video to backend:
+```bash
+curl.exe -F "file=@sample.mp4" http://localhost:8000/api/recipes/upload
+```
+Expected: JSON with `{ "id": "...", "status": "queued" }`.
+
+4) Poll until ready:
+```bash
+curl.exe http://localhost:8000/api/recipes/<ID>/status
+```
+Expected: JSON status transitions queued -> processing -> ready (or error).
+
+Then fetch full recipe:
+```bash
+curl.exe http://localhost:8000/api/recipes/<ID>
+```
+Expected: JSON record with populated `recipe_json.ingredients` and `recipe_json.steps`.
 
 ## Troubleshooting
-- **`ffmpeg` not found**
-  - Ensure `ffmpeg -version` works in the same shell used to run the backend.
-- **Ollama connection refused**
-  - Start Ollama and confirm `OLLAMA_HOST` matches the running instance, usually `http://localhost:11434`.
-- **Model not found**
-  - Run `ollama pull qwen2.5:7b-instruct` and, if vision is enabled, `ollama pull llava:7b`.
-- **Transcription slow**
-  - Use `TRANSCRIPTION_MODEL_SIZE=tiny` or `base`, or switch to `TRANSCRIPTION_DEVICE=cuda` with `TRANSCRIPTION_COMPUTE_TYPE=float16` on a compatible GPU.
-- **Model returns invalid JSON**
-  - The app retries once with a strict repair prompt. If the repair also fails, recipe status becomes `error` and the error message is stored.
+- **Ollama not reachable**: ensure Ollama app/service is running and `OLLAMA_HOST` is correct.
+- **Model not found**: run `ollama pull qwen2.5:7b-instruct` and confirm via `/api/tags`.
+- **ffmpeg not found**: install ffmpeg and ensure it is in `PATH`.
+- **Transcription too slow**: lower `TRANSCRIPTION_MODEL_SIZE` (e.g., `base` or `tiny`).
+- **JSON invalid**: pipeline retries once with a repair prompt; if it still fails, job is marked `error` with message.
 
-## Running tests
-```bash
-cd backend
-python -m pytest
-```
+## API
+- `POST /api/recipes/upload` (multipart form file) -> `{id,status}`
+- `GET /api/recipes/{id}/status` -> `{status,progress,error_message}`
+- `GET /api/recipes/{id}` -> job record + parsed `recipe_json`
+- `PUT /api/recipes/{id}` -> update `recipe_json`
+- `GET /api/recipes` -> list recent recipes
 
-## Notes
-- Upload-only by design (no URL ingestion or scraping).
-- The app runs end-to-end offline after the local models have been downloaded.
-- Works locally on Windows, macOS, and Linux with Python 3.11+ and Node 18+.
+## License
+MIT
